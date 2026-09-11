@@ -35,6 +35,10 @@ import webview
 import i18n
 from i18n import t
 
+_IS_MAC = sys.platform == "darwin"
+if _IS_MAC:
+    import macos_support as _mac
+
 # Nur damit PyInstaller die Tcl/Tk-Daten mit-buendelt (der eigentliche Import
 # passiert lazy im BuddyController-Thread).
 try:
@@ -306,6 +310,8 @@ DEFAULT_SETTINGS = {
     # Zeigt das Geraet dieselbe Animation wie der Buddy? Aus = es waehlt selbst
     # nach Auslastung aus (Originalverhalten der Firmware).
     "clawdmeter_buddy": True,
+    # macOS: Claude-Token erst nach Zustimmung aus dem Schluesselbund lesen
+    "mac_token_access": False,
 }
 
 # Wenn diese Konstante sich aendert, sehen bestehende Nutzer das Onboarding erneut
@@ -1023,6 +1029,8 @@ def decode_project(folder):
     Pfadtrenner unterscheidbar) -> nur als Notfall-Fallback verwenden."""
     if not folder:
         return ""
+    if sys.platform != "win32":
+        return "/" + folder.lstrip("-").replace("-", "/")
     return folder.replace("--", ":\\", 1).replace("-", "\\")
 
 
@@ -1052,6 +1060,15 @@ def resume_session(session_id, cwd, settings, project=""):
     # Wichtig: CLAUDE_CODE_FORCE_SESSION_PERSIST=1 setzen damit die resumed
     # Session weiterhin in die JSONL schreibt (sonst wird sie als Child erkannt
     # und Transcript-Speicherung ist aus).
+    if _IS_MAC:
+        err = _mac.open_in_terminal(
+            workdir, [claude, "--resume", sid],
+            {"CLAUDE_CODE_FORCE_SESSION_PERSIST": "1"}, term)
+        if err:
+            return {"ok": False,
+                    "error": t("Terminal konnte nicht geöffnet werden: {grund}",
+                               grund=err)}
+        return {"ok": True}
     env = os.environ.copy()
     env["CLAUDE_CODE_FORCE_SESSION_PERSIST"] = "1"
     try:
@@ -1084,6 +1101,10 @@ def _win_enum_monitors():
     """Liste aller Monitore mit Arbeitsbereich, primaer-Flag, Kurzlabel.
     Rueckgabe: [{'idx': 0, 'left': ..., 'top': ..., 'right': ..., 'bottom': ...,
     'primary': True/False, 'label': 'Primär 1920×1080'}]"""
+    if _IS_MAC:
+        return _label_monitors([
+            {k: s[k] for k in ("left", "top", "right", "bottom", "primary")}
+            for s in _mac.screens()])
     if not _IS_WIN:
         return []
 
@@ -1118,7 +1139,10 @@ def _win_enum_monitors():
         u.EnumDisplayMonitors(0, 0, MONITORENUMPROC(cb), 0)
     except Exception:
         return []
+    return _label_monitors(result)
 
+
+def _label_monitors(result):
     # Primaeren nach vorne, Rest links->rechts oben->unten
     result.sort(key=lambda m: (0 if m["primary"] else 1, m["top"], m["left"]))
     for i, m in enumerate(result):
@@ -1133,6 +1157,8 @@ def _win_enum_monitors():
 def _win_monitor_work_from_point(x, y):
     """Arbeitsbereich (ohne Taskleiste) des Monitors, auf dem Punkt (x,y)
     liegt. Rueckgabe: (left, top, right, bottom) oder None."""
+    if _IS_MAC:
+        return _mac.work_area_at(x, y)
     if not _IS_WIN:
         return None
     try:
@@ -1226,8 +1252,10 @@ def _anchor_position(anchor, size_px, current_x, current_y, monitor_idx=None):
 
 
 def _win_foreground_title():
-    """Titel des aktuell fokussierten Fensters (nur Windows). Leerer String
-    wenn nicht ermittelbar."""
+    """Titel des aktuell fokussierten Fensters. Leerer String wenn nicht
+    ermittelbar."""
+    if _IS_MAC:
+        return _mac.frontmost_title("Claude Session Browser")
     if not _IS_WIN:
         return ""
     try:
@@ -1378,6 +1406,9 @@ def _claude_context_active():
         # claude.exe) - das ist ein Chat-Client, kein CLI, und hat nichts mit
         # unserer JSONL-Detection zu tun. Wir filtern nach Prozesspfad falls
         # verfuegbar.
+        if _IS_MAC:
+            for pid in _mac.claude_cli_pids():
+                keys.add(("pid", pid))
         for name, path, pid in _win_process_names_with_path():
             if name != "claude.exe":
                 continue
@@ -1400,6 +1431,11 @@ def _claude_context_active():
             "opera.exe", "opera_gx.exe", "vivaldi.exe", "librewolf.exe",
             "zen.exe", "arc.exe", "iexplore.exe", "safari.exe",
             "thorium.exe", "chromium.exe", "waterfox.exe", "floorp.exe",
+            # macOS: Programmnamen statt Dateinamen; "claude" ist die
+            # Desktop-App, ein Chat-Programm
+            "safari", "google chrome", "firefox", "arc", "brave browser",
+            "microsoft edge", "opera", "vivaldi", "chromium", "orion", "zen",
+            "dia", "claude",
         }
         # Der Titel bleibt als zweites Netz - fuer Browser, die hier nicht
         # gelistet sind, und fuer Web-Claude in einem beliebigen Programm.
@@ -1474,6 +1510,8 @@ def _win_hwnd_process(hwnd):
     gleich, der Prozess dahinter auch - und die Abfrage kostet zwei
     Systemaufrufe pro Fenster, das waere im 2-Sekunden-Takt Verschwendung.
     """
+    if _IS_MAC:
+        return _mac.window_owner(hwnd).lower()
     if not _IS_WIN:
         return ""
     hit = _HWND_PROC_CACHE.get(hwnd)
@@ -1505,6 +1543,8 @@ def _win_hwnd_process(hwnd):
 
 def _win_list_windows_hwnd():
     """Sichtbare Fenster als (hwnd, titel)-Liste, ungefiltert."""
+    if _IS_MAC:
+        return [(w["num"], w["title"]) for w in _mac.window_list() if w["title"]]
     if not _IS_WIN:
         return []
     try:
@@ -1536,6 +1576,12 @@ def _win_list_windows_hwnd():
 def _win_list_windows():
     """Liste sichtbarer Fenstertitel (Duplikate raus). Fuer den Picker im
     Buddy-Tab."""
+    if _IS_MAC:
+        # Ohne Freigabe "Bildschirmaufnahme" gibt es nur Programmnamen - die
+        # reichen fuer "nur wenn dieses Programm vorne ist".
+        names = {(f"{w['owner']} — {w['title']}" if w["title"] else w["owner"])
+                 for w in _mac.window_list() if w["owner"]}
+        return sorted(names, key=str.lower)
     seen = []
     seen_set = set()
     for _hwnd, t in _win_list_windows_hwnd():
@@ -1772,6 +1818,20 @@ def _shade_hex(hex_color, factor):
         return hex_color
 
 
+def _system_notify(api, message, title="Clawd"):
+    """Systembenachrichtigung - unter Windows ueber das Tray-Icon, unter
+    macOS direkt ueber die Mitteilungen."""
+    if _IS_MAC:
+        _mac.notify(message, title)
+        return
+    tray = getattr(api, "_tray", None)
+    if tray and tray.icon:
+        try:
+            tray.icon.notify(message, title)
+        except Exception:
+            pass
+
+
 class BuddyController:
     """Zeigt einen kleinen Clawd-Buddy als frameloses, transparentes,
     always-on-top Tkinter-Fenster. Laeuft in einem Daemon-Thread. Wechselt
@@ -1803,6 +1863,8 @@ class BuddyController:
     def _app_window_visible(self):
         """True wenn das Session-Browser-Hauptfenster gerade wirklich als
         sichtbares Fenster existiert (nicht im Tray minimiert/verstecked)."""
+        if _IS_MAC:
+            return _mac.main_window_visible()
         if not _IS_WIN:
             return True
         try:
@@ -1850,8 +1912,9 @@ class BuddyController:
         if not BUDDY_ANIMS:
             return                  # Sprites konnten nicht dekodiert werden
         self._alive = True
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="BuddyThread")
+        self._thread = threading.Thread(
+            target=self._run_mac if _IS_MAC else self._run, daemon=True,
+            name="BuddyThread")
         self._thread.start()
 
     def stop(self):
@@ -1892,20 +1955,15 @@ class BuddyController:
         try:
             toast = getattr(self.api, "_reset_toast", None)
             if toast is None:
-                toast = LimitResetToast()
+                toast = (_mac.ResetCard(_dodge_y) if _IS_MAC
+                         else LimitResetToast())
                 self.api._reset_toast = toast
-            toast.show(avoid=self._pub_rect)
+            toast.show(t("Dein Claude-Limit ist zurückgesetzt"),
+                       t("Du kannst weitermachen"), avoid=self._pub_rect)
         except Exception:
             pass
         # Zusaetzlich Tray-Notification als Bonus
-        tray = getattr(self.api, "_tray", None)
-        if tray and tray.icon:
-            try:
-                tray.icon.notify(
-                    t("Dein Claude-Limit ist zurück – weitermachen!"),
-                    "Clawd")
-            except Exception:
-                pass
+        _system_notify(self.api, t("Dein Claude-Limit ist zurück – weitermachen!"))
         # Buddy kurz "surprise" spielen wenn er sichtbar ist
         try:
             if self.is_alive():
@@ -1963,6 +2021,274 @@ class BuddyController:
         self._on_place_done = on_done
         if self.is_alive():
             self._q.put(("place", True))
+
+    # ---- Zustandslogik ----
+    # Unabhaengig davon, womit gezeichnet wird: der Tk-Thread unter Windows
+    # und der AppKit-Buddy unter macOS teilen sie sich. `state` ist das
+    # Zustands-Dict des jeweiligen Buddy-Threads.
+
+    # States die als "aktiv arbeitend" gelten
+    _WORKING_STATES = {"tool_running", "processing_tool_result",
+                       "responding_text", "thinking", "user_sent_prompt"}
+
+    def _fg_title(self, state):
+        tick = state.get("tick", 0)
+        if tick - state.get("fg_tick", -999) >= self._FG_CHECK_EVERY:
+            state["fg_title"] = _win_foreground_title().lower()
+            state["fg_tick"] = tick
+        return state.get("fg_title", "")
+
+    def _desired_visible_raw(self, state):
+        bud = self.api.settings.get("buddy", {})
+        if not bud.get("enabled"):
+            return False
+        # Buddy-Tab: immer sichtbar (auch waehrend Foreground-Racing) -
+        # ABER nur wenn das Hauptfenster auch tatsaechlich sichtbar ist.
+        # Wenn die App in den Tray minimiert wurde bleibt _current_view
+        # zwar auf "buddy" stehen, aber dann sollen die normalen
+        # Sichtbarkeits-Regeln (when_claude etc.) greifen statt Buddy
+        # ewig auf dem Desktop rumhaengen zu lassen.
+        if getattr(self.api, "_current_view", "") == "buddy":
+            if self._app_window_visible():
+                return True
+        fg = self._fg_title(state)
+        # Session Browser vorne (auf anderem Tab) -> Buddy weg.
+        if fg.strip() == _OWN_APP_TITLE_EXACT:
+            return False
+        mode = bud.get("visibility", "when_claude")
+        if mode == "always":
+            return True
+        if mode == "when_window":
+            needle = (bud.get("target_window") or "").lower().strip()
+            if not needle:
+                return True
+            return needle in fg
+        if mode == "when_claude":
+            return _claude_context_active()
+        return True
+
+    def _desired_visible(self, state):
+        """Wie _desired_visible_raw, aber mit Snooze.
+
+        Doppel-/Rechtsklick blendet den Buddy nur voruebergehend aus - er
+        bleibt in den Settings aktiviert. Zurueck kommt er sobald ein
+        NEUER Claude-Kontext auftaucht (neues Terminal) oder alle
+        weggeklickten Terminals zu sind.
+
+        Bewusst NICHT beendet wird der Snooze durch blosses Alt-Tabben:
+        dass der Buddy nach den normalen Regeln gerade unsichtbar ist
+        heisst nicht, dass der User ihn wiederhaben will.
+        """
+        want = self._desired_visible_raw(state)
+        snooze = state.get("snooze_keys")
+        if snooze is not None:
+            keys = _claude_context_keys()
+            on_buddy_tab = (
+                getattr(self.api, "_current_view", "") == "buddy"
+                and self._app_window_visible())
+            if state.get("placing") or on_buddy_tab:
+                # Buddy-Tab offen oder Platzier-Modus -> immer zeigen,
+                # sonst sucht der User im Leeren.
+                state["snooze_keys"] = None
+                state["snooze_empty_since"] = 0.0
+            else:
+                over, since = _snooze_over(
+                    snooze, keys,
+                    state.get("snooze_empty_since") or 0.0, time.time())
+                state["snooze_empty_since"] = since
+                if not over:
+                    return False
+                state["snooze_keys"] = None
+        return want
+
+    def _detect_state(self, state):
+        # Status-Check mtime-getrieben: bei neuer mtime sofort pruefen,
+        # sonst throttlen. State-Stabilisierung: "coding" bleibt stabil bei
+        # frischer Aktivitaet, kurze Zwischenzustaende unterbrechen nicht.
+        now = time.time()
+        # mtime-Check: immer schnell (alle 500ms)
+        if now - state["last_mtime_check"] > 0.5:
+            state["last_mtime_check"] = now
+            pdir = ""
+            try:
+                pdir = self.api._projects_dir()
+            except Exception:
+                pdir = ""
+            new_mtime = _latest_session_mtime(pdir)
+            mtime_changed = new_mtime != state["last_known_mtime"]
+            state["last_known_mtime"] = new_mtime
+            state["last_mtime"] = new_mtime
+
+            # Status-Check: sofort bei mtime-Aenderung, sonst max alle 2s
+            should_check = mtime_changed or (now - state["last_status_check"] > 2.0)
+
+            if new_mtime > 0 and should_check:
+                state["last_status_check"] = now
+                try:
+                    status = _latest_jsonl_status(pdir)
+                except Exception:
+                    status = {"internal_state": "no_session", "is_limit": False}
+
+                # Limit mit Hysterese: bleibt aktiv bis reset_at oder 60s
+                new_limited = bool(status.get("is_limit"))
+                new_limit_type = status.get("limit_type")
+                reset_at = float(status.get("reset_at") or 0.0)
+
+                if new_limited:
+                    state["is_limited"] = True
+                    state["limit_type"] = new_limit_type
+                    if reset_at > 0:
+                        state["limited_until"] = reset_at
+                    else:
+                        # Kein reset_at: 60s Hysterese
+                        state["limited_until"] = now + 60
+                    # Reset-Zeit speichern
+                    try:
+                        prev = float(self.api.settings.get("limit_reset_at", 0) or 0)
+                        if reset_at > 0 and abs(prev - reset_at) > 30:
+                            self.api.settings["limit_reset_at"] = reset_at
+                            save_json(SETTINGS_FILE, self.api.settings)
+                            self._schedule_reset_timer(reset_at)
+                    except Exception:
+                        pass
+                elif state["is_limited"]:
+                    # Limit aufheben nur wenn Hysterese abgelaufen
+                    if now > state["limited_until"]:
+                        # Erfolgreiche neue Aktivitaet -> Limit aufheben
+                        int_state = status.get("internal_state", "")
+                        if int_state in self._WORKING_STATES or int_state == "done":
+                            try:
+                                self._notify_limit_reset()
+                            except Exception:
+                                pass
+                            state["is_limited"] = False
+                            state["limit_type"] = None
+
+                state["is_waiting"] = bool(status.get("waiting"))
+                state["is_awaiting_approval"] = bool(status.get("awaiting_approval"))
+                state["last_block_type"] = status.get("last_block_type")
+                state["last_tool_name"] = status.get("last_tool_name")
+                state["internal_state"] = status.get("internal_state", "unknown_active")
+
+        if state["last_mtime"] <= 0:
+            return "none"
+
+        age = now - state["last_mtime"]
+        int_state = state.get("internal_state", "unknown_active")
+
+        # HIGH-PRIO States: sofort anzeigen
+        if state["is_limited"] and age < 3600:
+            return "limit"
+        if state["is_awaiting_approval"] and age < 300:
+            return "awaiting_approval"
+        if int_state == "done" and age < 180:
+            return "waiting"
+
+        # Arbeitszustaende. Frueher galt hier: einmal "active", und die
+        # naechsten FUENF MINUTEN blieb es dabei, egal was Claude
+        # tatsaechlich tat. Das sollte Flackern verhindern, war als Mittel
+        # aber viel zu grob - Clawd stand minutenlang auf "arbeitet",
+        # waehrend Claude laengst nachdachte oder Text schrieb. Genau
+        # deshalb passten die Animationen so oft nicht.
+        #
+        # Jetzt folgt der Zustand dem Geschehen; gegen Flackern reicht die
+        # kurze Standzeit (_STATE_DEBOUNCE_S), die in _step_anim() beim
+        # Anim-Wechsel greift.
+        if int_state in self._WORKING_STATES and age < 300:
+            if state["stable_state"] != int_state:
+                state["stable_state"] = int_state
+                state["stable_since"] = now
+            if int_state in ("thinking", "user_sent_prompt"):
+                return "thinking"
+            if int_state == "tool_pending_approval":
+                return "awaiting_approval"
+            return "active"
+
+        # Nicht mehr aktiv arbeitend - stable state zuruecksetzen
+        if int_state not in self._WORKING_STATES:
+            state["stable_state"] = None
+            state["stable_since"] = 0.0
+
+        # DONE vs IDLE: done nur bei end_turn, idle durch Zeit
+        if state["is_waiting"] and age < 180:
+            return "waiting"
+        if age < 300:
+            return "recent"
+        if age < 900:
+            return "idle"
+        return "sleep"
+
+    def _choose_anim(self, state):
+        bud = self.api.settings.get("buddy", {})
+        now = time.time()
+        # Preview-Test aus dem Buddy-Tab hat hoechste Prioritaet
+        if now < state["preview_until"] and state["preview_anim"] in BUDDY_ANIMS:
+            return state["preview_anim"]
+        # Surprise-Pulse (z.B. Reset-Karte oder Test-Button)
+        if now < state["surprise_until"]:
+            return BUDDY_STATE_MAP["surprise"]
+        # Wink-Easter-Egg: ein Mal pro Hover-Session zwinkern nach 10s
+        # Dwell. Weiter zwinkern erst nach neuem Mouse-Leave/Enter.
+        if state.get("hover") and state["hover_started_at"] > 0 \
+                and not state.get("wink_fired_this_hover"):
+            dwell = now - state["hover_started_at"]
+            if dwell > 10:
+                state["wink_fired_this_hover"] = True
+                state["wink_until"] = now + 2.5
+        if now < state["wink_until"]:
+            return BUDDY_STATE_MAP["wink"]
+        # Party-Modus mit waehlbarem Stil (bounce oder sway)
+        if bud.get("party"):
+            style = str(bud.get("party_style", "bounce")).lower()
+            if style == "sway":
+                return BUDDY_STATE_MAP["party_sway"]
+            return BUDDY_STATE_MAP["party"]
+        act = self._detect_state(state)
+        state["activity_state"] = act
+        # Ein State = eine Anim, so lang der State anhaelt. Kein Rotieren
+        # zwischen "work coding" und "write" alle 30s mehr - der User hat
+        # zu Recht gesagt: wenn Claude 10 Min codet soll auch 10 Min
+        # "work coding" laufen. Weniger Bewegung im Augenwinkel.
+        # ("write" und "think" sind weiter ueber die Preview-Kachel im
+        # Buddy-Tab antestbar, nur nicht mehr in der Auto-Rotation.)
+        return BUDDY_STATE_MAP.get(act, "idle breathe")
+
+    def _step_anim(self, state):
+        """Waehlt die Animation und wechselt erst, wenn der Wunsch stabil ist.
+
+        Debounce: nicht bei jedem Tick zwischen Anims flackern. Neue Ziel-Anim
+        muss _STATE_DEBOUNCE_S lang stabil gewuenscht sein bevor gewechselt
+        wird. Ausnahmen (sofort schalten): high-priority Signale wie
+        allow/limit/surprise/wink/preview - der User soll sie ohne
+        Verzoegerung sehen."""
+        chosen = self._choose_anim(state)
+        _priority = {"limit", "allow", "expression surprise",
+                     "expression wink"}
+        now = time.time()
+        if chosen != state["anim"]:
+            if chosen in _priority or state.get("preview_until", 0) > now:
+                state["anim"] = chosen
+                state["frame"] = 0
+                state["last_frame_at"] = 0.0
+                state["pending_anim"] = None
+                state["pending_since"] = 0.0
+            else:
+                if state.get("pending_anim") != chosen:
+                    state["pending_anim"] = chosen
+                    state["pending_since"] = now
+                elif now - state["pending_since"] >= self._STATE_DEBOUNCE_S:
+                    state["anim"] = chosen
+                    state["frame"] = 0
+                    state["pending_anim"] = None
+                    state["pending_since"] = 0.0
+        else:
+            # Ziel-Anim = aktuelle Anim -> pending zuruecksetzen
+            if state.get("pending_anim") is not None:
+                state["pending_anim"] = None
+                state["pending_since"] = 0.0
+        self._pub_anim = state["anim"]
+        self._pub_limit = (bool(state.get("is_limited")),
+                           float(state.get("limited_until") or 0.0))
 
     # ---- interner Thread ----
     def _run(self):
@@ -2258,77 +2584,9 @@ class BuddyController:
             except Exception:
                 return None
 
-        # ---- Sichtbarkeits-Logik (mit throttled foreground-check) ----
-        fg_cache = {"title": "", "tick": -999}
-
-        def _fg_title(tick_count):
-            if tick_count - fg_cache["tick"] >= self._FG_CHECK_EVERY:
-                fg_cache["title"] = _win_foreground_title().lower()
-                fg_cache["tick"] = tick_count
-            return fg_cache["title"]
-
-        def _desired_visible_raw():
-            bud = self.api.settings.get("buddy", {})
-            if not bud.get("enabled"):
-                return False
-            # Buddy-Tab: immer sichtbar (auch waehrend Foreground-Racing) -
-            # ABER nur wenn das Hauptfenster auch tatsaechlich sichtbar ist.
-            # Wenn die App in den Tray minimiert wurde bleibt _current_view
-            # zwar auf "buddy" stehen, aber dann sollen die normalen
-            # Sichtbarkeits-Regeln (when_claude etc.) greifen statt Buddy
-            # ewig auf dem Desktop rumhaengen zu lassen.
-            if getattr(self.api, "_current_view", "") == "buddy":
-                if self._app_window_visible():
-                    return True
-            fg = _fg_title(state.get("tick", 0))
-            # Session Browser vorne (auf anderem Tab) -> Buddy weg.
-            if fg.strip() == _OWN_APP_TITLE_EXACT:
-                return False
-            mode = bud.get("visibility", "when_claude")
-            if mode == "always":
-                return True
-            if mode == "when_window":
-                needle = (bud.get("target_window") or "").lower().strip()
-                if not needle:
-                    return True
-                return needle in fg
-            if mode == "when_claude":
-                return _claude_context_active()
-            return True
-
+        # ---- Sichtbarkeits-Logik: siehe _desired_visible() ----
         def desired_visible():
-            """Wie _desired_visible_raw, aber mit Snooze.
-
-            Doppel-/Rechtsklick blendet den Buddy nur voruebergehend aus - er
-            bleibt in den Settings aktiviert. Zurueck kommt er sobald ein
-            NEUER Claude-Kontext auftaucht (neues Terminal) oder alle
-            weggeklickten Terminals zu sind.
-
-            Bewusst NICHT beendet wird der Snooze durch blosses Alt-Tabben:
-            dass der Buddy nach den normalen Regeln gerade unsichtbar ist
-            heisst nicht, dass der User ihn wiederhaben will.
-            """
-            want = _desired_visible_raw()
-            snooze = state.get("snooze_keys")
-            if snooze is not None:
-                keys = _claude_context_keys()
-                on_buddy_tab = (
-                    getattr(self.api, "_current_view", "") == "buddy"
-                    and self._app_window_visible())
-                if state.get("placing") or on_buddy_tab:
-                    # Buddy-Tab offen oder Platzier-Modus -> immer zeigen,
-                    # sonst sucht der User im Leeren.
-                    state["snooze_keys"] = None
-                    state["snooze_empty_since"] = 0.0
-                else:
-                    over, since = _snooze_over(
-                        snooze, keys,
-                        state.get("snooze_empty_since") or 0.0, time.time())
-                    state["snooze_empty_since"] = since
-                    if not over:
-                        return False
-                    state["snooze_keys"] = None
-            return want
+            return self._desired_visible(state)
 
         _visible = {"v": None}
         state["invisible_since"] = 0.0  # Zeit seit want=False (0 wenn sichtbar)
@@ -2419,163 +2677,6 @@ class BuddyController:
         state["wink_until"] = 0.0
         state["last_alt_swap"] = 0.0
         state["use_alt"] = False
-
-        # States die "coding" blockieren duerfen (hohe Prioritaet)
-        _HIGH_PRIO_STATES = {"done", "tool_pending_approval", "rate_limited",
-                            "auth_required", "api_overloaded", "no_session"}
-        # States die als "aktiv arbeitend" gelten
-        _WORKING_STATES = {"tool_running", "processing_tool_result",
-                          "responding_text", "thinking", "user_sent_prompt"}
-
-        def detect_state():
-            now = time.time()
-            # mtime-Check: immer schnell (alle 500ms)
-            if now - state["last_mtime_check"] > 0.5:
-                state["last_mtime_check"] = now
-                pdir = ""
-                try:
-                    pdir = self.api._projects_dir()
-                except Exception:
-                    pdir = ""
-                new_mtime = _latest_session_mtime(pdir)
-                mtime_changed = new_mtime != state["last_known_mtime"]
-                state["last_known_mtime"] = new_mtime
-                state["last_mtime"] = new_mtime
-
-                # Status-Check: sofort bei mtime-Aenderung, sonst max alle 2s
-                should_check = mtime_changed or (now - state["last_status_check"] > 2.0)
-
-                if new_mtime > 0 and should_check:
-                    state["last_status_check"] = now
-                    try:
-                        status = _latest_jsonl_status(pdir)
-                    except Exception:
-                        status = {"internal_state": "no_session", "is_limit": False}
-
-                    # Limit mit Hysterese: bleibt aktiv bis reset_at oder 60s
-                    new_limited = bool(status.get("is_limit"))
-                    new_limit_type = status.get("limit_type")
-                    reset_at = float(status.get("reset_at") or 0.0)
-
-                    if new_limited:
-                        state["is_limited"] = True
-                        state["limit_type"] = new_limit_type
-                        if reset_at > 0:
-                            state["limited_until"] = reset_at
-                        else:
-                            # Kein reset_at: 60s Hysterese
-                            state["limited_until"] = now + 60
-                        # Reset-Zeit speichern
-                        try:
-                            prev = float(self.api.settings.get("limit_reset_at", 0) or 0)
-                            if reset_at > 0 and abs(prev - reset_at) > 30:
-                                self.api.settings["limit_reset_at"] = reset_at
-                                save_json(SETTINGS_FILE, self.api.settings)
-                                self._schedule_reset_timer(reset_at)
-                        except Exception:
-                            pass
-                    elif state["is_limited"]:
-                        # Limit aufheben nur wenn Hysterese abgelaufen
-                        if now > state["limited_until"]:
-                            # Erfolgreiche neue Aktivitaet -> Limit aufheben
-                            int_state = status.get("internal_state", "")
-                            if int_state in _WORKING_STATES or int_state == "done":
-                                try:
-                                    self._notify_limit_reset()
-                                except Exception:
-                                    pass
-                                state["is_limited"] = False
-                                state["limit_type"] = None
-
-                    state["is_waiting"] = bool(status.get("waiting"))
-                    state["is_awaiting_approval"] = bool(status.get("awaiting_approval"))
-                    state["last_block_type"] = status.get("last_block_type")
-                    state["last_tool_name"] = status.get("last_tool_name")
-                    state["internal_state"] = status.get("internal_state", "unknown_active")
-
-            if state["last_mtime"] <= 0:
-                return "none"
-
-            age = now - state["last_mtime"]
-            int_state = state.get("internal_state", "unknown_active")
-
-            # HIGH-PRIO States: sofort anzeigen
-            if state["is_limited"] and age < 3600:
-                return "limit"
-            if state["is_awaiting_approval"] and age < 300:
-                return "awaiting_approval"
-            if int_state == "done" and age < 180:
-                return "waiting"
-
-            # Arbeitszustaende. Frueher galt hier: einmal "active", und die
-            # naechsten FUENF MINUTEN blieb es dabei, egal was Claude
-            # tatsaechlich tat. Das sollte Flackern verhindern, war als Mittel
-            # aber viel zu grob - Clawd stand minutenlang auf "arbeitet",
-            # waehrend Claude laengst nachdachte oder Text schrieb. Genau
-            # deshalb passten die Animationen so oft nicht.
-            #
-            # Jetzt folgt der Zustand dem Geschehen; gegen Flackern reicht die
-            # kurze Standzeit (_STATE_DEBOUNCE_S), die weiter unten beim
-            # Anim-Wechsel greift.
-            if int_state in _WORKING_STATES and age < 300:
-                if state["stable_state"] != int_state:
-                    state["stable_state"] = int_state
-                    state["stable_since"] = now
-                if int_state in ("thinking", "user_sent_prompt"):
-                    return "thinking"
-                if int_state == "tool_pending_approval":
-                    return "awaiting_approval"
-                return "active"
-
-            # Nicht mehr aktiv arbeitend - stable state zuruecksetzen
-            if int_state not in _WORKING_STATES:
-                state["stable_state"] = None
-                state["stable_since"] = 0.0
-
-            # DONE vs IDLE: done nur bei end_turn, idle durch Zeit
-            if state["is_waiting"] and age < 180:
-                return "waiting"
-            if age < 300:
-                return "recent"
-            if age < 900:
-                return "idle"
-            return "sleep"
-
-        # ---- Anim wechseln ----
-        def choose_anim():
-            bud = self.api.settings.get("buddy", {})
-            now = time.time()
-            # Preview-Test aus dem Buddy-Tab hat hoechste Prioritaet
-            if now < state["preview_until"] and state["preview_anim"] in BUDDY_ANIMS:
-                return state["preview_anim"]
-            # Surprise-Pulse (z.B. Reset-Karte oder Test-Button)
-            if now < state["surprise_until"]:
-                return BUDDY_STATE_MAP["surprise"]
-            # Wink-Easter-Egg: ein Mal pro Hover-Session zwinkern nach 10s
-            # Dwell. Weiter zwinkern erst nach neuem Mouse-Leave/Enter.
-            if state.get("hover") and state["hover_started_at"] > 0 \
-                    and not state.get("wink_fired_this_hover"):
-                dwell = now - state["hover_started_at"]
-                if dwell > 10:
-                    state["wink_fired_this_hover"] = True
-                    state["wink_until"] = now + 2.5
-            if now < state["wink_until"]:
-                return BUDDY_STATE_MAP["wink"]
-            # Party-Modus mit waehlbarem Stil (bounce oder sway)
-            if bud.get("party"):
-                style = str(bud.get("party_style", "bounce")).lower()
-                if style == "sway":
-                    return BUDDY_STATE_MAP["party_sway"]
-                return BUDDY_STATE_MAP["party"]
-            act = detect_state()
-            state["activity_state"] = act
-            # Ein State = eine Anim, so lang der State anhaelt. Kein Rotieren
-            # zwischen "work coding" und "write" alle 30s mehr - der User hat
-            # zu Recht gesagt: wenn Claude 10 Min codet soll auch 10 Min
-            # "work coding" laufen. Weniger Bewegung im Augenwinkel.
-            # ("write" und "think" sind weiter ueber die Preview-Kachel im
-            # Buddy-Tab antestbar, nur nicht mehr in der Auto-Rotation.)
-            return BUDDY_STATE_MAP.get(act, "idle breathe")
 
         # ---- Rendering (mit Frame-Cache) ----
         render_cache = {}
@@ -2737,39 +2838,8 @@ class BuddyController:
                 return
             apply_visibility()
             step_fade()
-            chosen = choose_anim()
-            # Debounce: nicht bei jedem 300ms-Tick zwischen Anims flackern.
-            # Neue Ziel-Anim muss _STATE_DEBOUNCE_S lang stabil gewuenscht sein
-            # bevor gewechselt wird. Ausnahmen (sofort schalten): high-priority
-            # Signale wie allow/limit/surprise/wink/preview - der User soll sie
-            # ohne Verzoegerung sehen.
-            _priority = {"limit", "allow", "expression surprise",
-                         "expression wink"}
+            self._step_anim(state)
             now = time.time()
-            if chosen != state["anim"]:
-                if chosen in _priority or state.get("preview_until", 0) > now:
-                    state["anim"] = chosen
-                    state["frame"] = 0
-                    state["last_frame_at"] = 0.0
-                    state["pending_anim"] = None
-                    state["pending_since"] = 0.0
-                else:
-                    if state.get("pending_anim") != chosen:
-                        state["pending_anim"] = chosen
-                        state["pending_since"] = now
-                    elif now - state["pending_since"] >= self._STATE_DEBOUNCE_S:
-                        state["anim"] = chosen
-                        state["frame"] = 0
-                        state["pending_anim"] = None
-                        state["pending_since"] = 0.0
-            else:
-                # Ziel-Anim = aktuelle Anim -> pending zuruecksetzen
-                if state.get("pending_anim") is not None:
-                    state["pending_anim"] = None
-                    state["pending_since"] = 0.0
-            self._pub_anim = state["anim"]
-            self._pub_limit = (bool(state.get("is_limited")),
-                               float(state.get("limited_until") or 0.0))
             # Wo der Buddy steht, zum Mitlesen: die Reset-Karte kommt oben
             # rechts herein und wuerde sonst unter ihm landen. Bewusst
             # unabhaengig davon, ob er gerade eingeblendet ist - dieselbe
@@ -2822,6 +2892,319 @@ class BuddyController:
         finally:
             self._alive = False
             self._pub_rect = None
+
+    # ---- macOS: derselbe Ablauf, gezeichnet mit AppKit ----
+    def _run_mac(self):
+        """Gegenstueck zu _run() fuer macOS. Die Logik laeuft hier im
+        Buddy-Thread; das Fenster lebt auf dem Hauptthread und bekommt pro
+        Tick nur, was sich geaendert hat."""
+        import math
+
+        s = dict(self.api.settings.get("buddy", {}))
+        state = {
+            "x": int(s.get("x", 200)), "y": int(s.get("y", 200)),
+            "scale": max(2, min(10, int(s.get("size", 4)))),
+            "opacity": max(20, min(100, int(s.get("opacity", 100)))) / 100.0,
+            "frame_style": _resolved_frame_style(s),
+            "frame_color": s.get("frame_color") or "#ec7456",
+            "frame_label": s.get("frame_label") or "CLAWD",
+            "anim": "idle breathe", "frame": 0, "tick": 0,
+            "current_alpha": 0.0, "target_alpha": 0.0,
+            "was_visible": False, "shown": False, "invisible_since": 0.0,
+            "hover": False, "hover_started_at": 0.0, "wink_until": 0.0,
+            "wink_fired_this_hover": False,
+            "surprise_until": 0.0, "preview_until": 0.0, "preview_anim": "",
+            "placing": False, "place_pulse": 0.0, "overlay": None, "ring": 0,
+            "snooze_keys": None, "snooze_empty_since": 0.0,
+            "last_mtime_check": 0.0, "last_known_mtime": 0.0,
+            "last_mtime": 0.0, "last_status_check": 0.0,
+            "is_limited": False, "limit_type": None, "limited_until": 0.0,
+            "is_waiting": False, "is_awaiting_approval": False,
+            "last_block_type": None, "last_tool_name": None,
+            "internal_state": "no_session", "stable_state": None,
+            "stable_since": 0.0, "activity_state": "idle",
+            "last_frame_at": 0.0,
+        }
+        handler = _MacBuddyHandler(self, state)
+        # Vor dem Start der Ereignisschleife wartet das bis sie laeuft.
+        win = _mac.on_main_sync(lambda: _mac.BuddyWindow(handler), timeout=30.0)
+        if win is None:
+            self._alive = False
+            return
+        handler.win = win
+
+        def look():
+            """Groesse und Rahmen aus dem Zustand, als Zeichen-Auftrag."""
+            sc, style = state["scale"], state["frame_style"]
+            pad = _frame_pad(style, sc)
+            w = 20 * sc + pad["l"] + pad["r"]
+            h = 20 * sc + pad["t"] + pad["b"]
+            state["px_w"], state["px_h"] = w, h
+            spec = None
+            if style == "classic":
+                c = state["frame_color"]
+                spec = {"w": w, "h": h, "pad_l": pad["l"], "pad_r": pad["r"],
+                        "pad_t": pad["t"], "pad_b": pad["b"], "color": c,
+                        "darker": _shade_hex(c, 0.55),
+                        "accent_dim": _shade_hex(c, 0.75),
+                        "label": (state["frame_label"] or "CLAWD").upper()[:7]}
+            return {"csb_scale": sc, "csb_pad": (pad["l"], pad["t"]),
+                    "csb_frame": spec,
+                    "geometry": (state["x"], state["y"], w, h)}
+
+        last_key = [None]
+        pix_cache = {}
+
+        def render_frame(ui):
+            name = state["anim"]
+            anim = BUDDY_ANIMS.get(name) or next(iter(BUDDY_ANIMS.values()))
+            frames = anim["frames"]
+            if not frames:
+                return
+            idx = state["frame"] % len(frames)
+            # Wie unter Windows: ohne Rahmen ist der Hintergrund durchsichtig
+            # und laesst Klicks durch - beim Platzieren wird er deckend, damit
+            # sich der Buddy ueberall greifen laesst.
+            bg = (None if state["frame_style"] == "off" and not state["placing"]
+                  else "#14100e")
+            key = (name, idx, bg)
+            if key != last_key[0]:
+                px = pix_cache.get((name, idx))
+                if px is None:
+                    if len(pix_cache) > 400:
+                        pix_cache.clear()
+                    px = pix_cache[(name, idx)] = _sprite_pixels(anim, idx)
+                ui["csb_pixels"] = px
+                ui["csb_bg"] = bg
+                last_key[0] = key
+            state["frame"] += 1
+
+        def set_shown(ui, on):
+            ui["visible"] = on
+            state["shown"] = on
+
+        def apply_visibility(ui):
+            want = self._desired_visible(state)
+            if want:
+                state["target_alpha"] = (min(state["opacity"], 0.15)
+                                         if state.get("hover")
+                                         else state["opacity"])
+                state["invisible_since"] = 0.0
+            else:
+                state["target_alpha"] = 0.0
+                if state["invisible_since"] == 0.0:
+                    state["invisible_since"] = time.time()
+            if want and not state["was_visible"]:
+                state["current_alpha"] = 0.0
+                ui["alpha"] = 0.0
+                set_shown(ui, True)
+            state["was_visible"] = want
+            if (not want and state["shown"] and state["invisible_since"] > 0
+                    and time.time() - state["invisible_since"] > 4.0):
+                state["current_alpha"] = 0.0
+                ui["alpha"] = 0.0
+                set_shown(ui, False)
+
+        def step_fade(ui):
+            cur, tgt = state["current_alpha"], state["target_alpha"]
+            if abs(cur - tgt) < 0.02:
+                if cur != tgt:
+                    state["current_alpha"] = tgt
+                    ui["alpha"] = tgt
+                    if tgt <= 0.001 and not state["was_visible"]:
+                        set_shown(ui, False)
+                return
+            step = 0.12 if tgt > cur else -0.12
+            new = cur + step
+            if (step > 0 and new > tgt) or (step < 0 and new < tgt):
+                new = tgt
+            state["current_alpha"] = new
+            ui["alpha"] = new
+
+        def end_place_mode(ui):
+            if not state["placing"]:
+                return
+            state["placing"] = False
+            state["ring"] = 0
+            ui["csb_ring"] = 0
+            last_key[0] = None
+            ov = state.get("overlay")
+            if ov is not None:
+                _mac.on_main(ov.close)
+                state["overlay"] = None
+            cb = getattr(self, "_on_place_done", None)
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+        def process_cmds(ui):
+            try:
+                while True:
+                    cmd, val = self._q.get_nowait()
+                    if cmd == "quit":
+                        return False
+                    if cmd == "refresh":
+                        # Wer an den Einstellungen dreht, will ihn sehen.
+                        state["snooze_keys"] = None
+                        state["snooze_empty_since"] = 0.0
+                        new = self.api.settings.get("buddy", {})
+                        new_scale = max(2, min(10, int(new.get("size", 4))))
+                        new_op = max(20, min(100, int(new.get("opacity", 100)))) / 100.0
+                        new_style = _resolved_frame_style(new)
+                        new_color = new.get("frame_color") or "#ec7456"
+                        new_label = new.get("frame_label") or "CLAWD"
+                        if (new_scale, new_style, new_color, new_label) != (
+                                state["scale"], state["frame_style"],
+                                state["frame_color"], state["frame_label"]):
+                            state.update(scale=new_scale, frame_style=new_style,
+                                         frame_color=new_color,
+                                         frame_label=new_label)
+                            ui.update(look())
+                            last_key[0] = None
+                        if abs(new_op - state["opacity"]) > 0.001:
+                            state["opacity"] = new_op
+                            if state["was_visible"]:
+                                state["target_alpha"] = new_op
+                    elif cmd == "hide_toggle":
+                        state["snooze_keys"] = _claude_context_keys()
+                        state["snooze_empty_since"] = 0.0
+                    elif cmd == "pulse":
+                        state["surprise_until"] = time.time() + 1.6
+                    elif cmd == "place":
+                        state["placing"] = True
+                        state["place_pulse"] = 0.0
+                        last_key[0] = None
+                        if state.get("overlay") is None:
+                            state["overlay"] = _mac.on_main_sync(
+                                lambda: _mac.PlaceOverlay(
+                                    lambda: self._q.put(("place_cancel", None))))
+                        ui["raise"] = True
+                    elif cmd in ("place_done", "place_cancel"):
+                        end_place_mode(ui)
+                    elif cmd == "preview":
+                        name, seconds = val
+                        if name in BUDDY_ANIMS:
+                            state["preview_anim"] = name
+                            state["preview_until"] = time.time() + seconds
+                    elif cmd == "jump":
+                        nx, ny = _snap_position(
+                            val[0], val[1], state.get("px_w", 20 * state["scale"]))
+                        state["x"], state["y"] = nx, ny
+                        ui["move"] = (nx, ny)
+                        bud = self.api.settings.setdefault("buddy", {})
+                        bud["x"], bud["y"] = nx, ny
+                        try:
+                            save_json(SETTINGS_FILE, self.api.settings)
+                        except Exception:
+                            pass
+            except queue.Empty:
+                pass
+            return True
+
+        _mac.on_main(win.apply, dict(look(), alpha=0.0))
+        try:
+            while self._alive:
+                started = time.time()
+                ui = {}
+                state["tick"] += 1
+                if not process_cmds(ui):
+                    break
+                apply_visibility(ui)
+                step_fade(ui)
+                self._step_anim(state)
+                now = time.time()
+                rect = (state["x"], state["y"], state["px_w"], state["px_h"])
+                self._pub_rect = rect
+                # Haengengebliebenes Hover aufloesen - siehe _run().
+                if state.get("hover"):
+                    mx, my = _mac.pointer_pos()
+                    rx, ry, rw, rh = rect
+                    if not (rx <= mx < rx + rw and ry <= my < ry + rh):
+                        _mac.on_main(handler.leave)
+                if (state["current_alpha"] > 0.01
+                        and now - state["last_frame_at"] >= self._FRAME_MS / 1000.0):
+                    render_frame(ui)
+                    state["last_frame_at"] = now
+                if state["placing"]:
+                    state["place_pulse"] = (state["place_pulse"] + 0.14) % 6.283
+                    ring = int(2 + 3 * (0.5 + 0.5 * math.sin(state["place_pulse"])))
+                    if ring != state["ring"]:
+                        state["ring"] = ring
+                        ui["csb_ring"] = ring
+                if ui:
+                    _mac.on_main(win.apply, ui)
+                time.sleep(max(0.0, self._TICK_MS / 1000.0 - (time.time() - started)))
+        finally:
+            ov = state.get("overlay")
+            if ov is not None:
+                _mac.on_main(ov.close)
+            _mac.on_main(win.close)
+            self._alive = False
+            self._pub_rect = None
+
+
+class _MacBuddyHandler:
+    """Maus-Ereignisse des macOS-Buddys, auf dem Hauptthread. Was den
+    Zustand umbaut, geht als Befehl in die Queue des Buddy-Threads - wie die
+    Tk-Bindings unter Windows."""
+
+    def __init__(self, ctl, state):
+        self.ctl, self.state, self.win = ctl, state, None
+
+    def snap(self, x, y):
+        st = self.state
+        nx, ny = _snap_position(x, y, st.get("px_w", 20 * st["scale"]))
+        st["x"], st["y"] = nx, ny
+        return nx, ny
+
+    def released(self, x, y):
+        st = self.state
+        st["x"], st["y"] = x, y
+        bud = self.ctl.api.settings.setdefault("buddy", {})
+        bud["x"], bud["y"] = x, y
+        try:
+            save_json(SETTINGS_FILE, self.ctl.api.settings)
+        except Exception:
+            pass
+        if st.get("placing"):
+            self.ctl._q.put(("place_done", None))
+
+    def hide_toggle(self):
+        self.ctl._q.put(("hide_toggle", None))
+
+    def enter(self):
+        st = self.state
+        st["hover"] = True
+        st["hover_started_at"] = time.time()
+        a = min(st["opacity"], 0.15)
+        st["current_alpha"] = st["target_alpha"] = a
+        if self.win is not None:
+            self.win.set_alpha(a)
+
+    def leave(self):
+        st = self.state
+        if not st.get("hover"):
+            return
+        st["hover"] = False
+        st["hover_started_at"] = 0.0
+        st["wink_fired_this_hover"] = False
+        if st.get("was_visible"):
+            a = st["opacity"]
+            st["current_alpha"] = st["target_alpha"] = a
+            if self.win is not None:
+                self.win.set_alpha(a)
+
+
+def _sprite_pixels(anim, idx):
+    """Ein Frame als 400 Hex-Farben; None fuer Hintergrund und leere Stellen
+    (siehe _hintergrund_index)."""
+    f = anim["frames"][idx]
+    palette = anim["palette"]
+    hg = _hintergrund_index(f)
+    return [None if (v <= 0 or v == hg or v >= len(palette)) else palette[v]
+            for v in f]
 
 
 # --------------------------------------------------------------------------- #
@@ -3081,6 +3464,14 @@ class TrayManager:
     def start(self):
         if self.icon:
             return
+        if _IS_MAC:
+            self.icon = _mac.StatusItemTray(
+                _menubar_icon_png(BUDDY_ANIMS.get("idle breathe")),
+                "Claude Session Browser",
+                [(lambda: t("Öffnen"), self.show_main),
+                 (lambda: t("Beenden"), self._quit_from_menu)])
+            self.icon.start()
+            return
         try:
             import pystray
             from PIL import Image
@@ -3142,6 +3533,8 @@ class TrayManager:
         win = self.get_window()
         if not win:
             return
+        if _IS_MAC:
+            _mac.set_dock_visible(True)
         try:
             win.show()
         except Exception:
@@ -3164,12 +3557,22 @@ class TrayManager:
             except Exception:
                 pass
 
+    def _quit_from_menu(self):
+        self.stop()
+        try:
+            self.on_quit()
+        except Exception:
+            pass
+
     def stop(self):
         if self.icon:
             try:
                 self.icon.stop()
             except Exception:
                 pass
+            # Sonst liesse sich das Icon nach dem Ausschalten nicht wieder
+            # starten - start() haelt ein vorhandenes fuer "laeuft schon".
+            self.icon = None
 
 
 # --------------------------------------------------------------------------- #
@@ -3179,6 +3582,11 @@ def _png_rgba(width, height, rows):
     """Minimales RGBA-PNG als data-URI. `rows` ist eine Liste von bytearrays
     (je 4*width Bytes). Pillow waere hier ein Import zu viel - PNG mit zlib
     selbst zu schreiben sind zwanzig Zeilen."""
+    png = _png_bytes(width, height, rows)
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _png_bytes(width, height, rows):
     raw = bytearray()
     for r in rows:
         raw.append(0)          # Filter "None" pro Zeile
@@ -3190,10 +3598,46 @@ def _png_rgba(width, height, rows):
 
     ihdr = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
             + bytes((8, 6, 0, 0, 0)))       # 8 bit, Farbtyp 6 = RGBA
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-           + chunk(b"IEND", b""))
-    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def _menubar_icon_png(anim, box_px=36):
+    """Clawd als Vorlage fuer die macOS-Menueleiste: Koerper deckend, Augen
+    und Hintergrund durchsichtig. macOS faerbt Vorlagen passend zur Leiste
+    ein, hell oder dunkel - Farben zaehlen hier nicht, nur die Deckkraft."""
+    if not anim or not anim.get("frames"):
+        return b""
+    frame, palette = anim["frames"][0], anim["palette"]
+    empty = {0, _hintergrund_index(frame)}
+
+    def solid(v):
+        if v in empty or v >= len(palette):
+            return False
+        hx = palette[v].lstrip("#")
+        r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+        return 0.299 * r + 0.587 * g + 0.114 * b >= 60
+
+    cells = [(i % 20, i // 20) for i, v in enumerate(frame) if solid(v)]
+    if not cells:
+        return b""
+    x0, x1 = min(c[0] for c in cells), max(c[0] for c in cells)
+    y0, y1 = min(c[1] for c in cells), max(c[1] for c in cells)
+    bw, bh = x1 - x0 + 1, y1 - y0 + 1
+    scale = max(1, box_px // max(bw, bh))
+    ox, oy = (box_px - bw * scale) // 2, (box_px - bh * scale) // 2
+    rows = []
+    for py in range(box_px):
+        row = bytearray(4 * box_px)
+        if oy <= py < oy + bh * scale:
+            gy = (py - oy) // scale + y0
+            for px_ in range(ox, ox + bw * scale):
+                gx = (px_ - ox) // scale + x0
+                if solid(frame[gy * 20 + gx]):
+                    row[4 * px_ + 3] = 255
+        rows.append(row)
+    return _png_bytes(box_px, box_px, rows)
 
 
 def _sprite_icon_png(anim, box_px=40):
@@ -3269,6 +3713,13 @@ class Api:
         self._current_view = "sessions"
         self.buddy = BuddyController(self)
         self._reset_toast = None
+        if _IS_MAC:
+            try:
+                import clawdmeter
+                clawdmeter.set_keychain_allowed(
+                    bool(self.settings.get("mac_token_access")))
+            except Exception:
+                pass
         # Startup-Nachhol: Reset-Zeit in der Vergangenheit + noch nicht
         # benachrichtigt → Karte jetzt nachtraeglich zeigen. Aussderdem
         # zukuenftige Reset-Zeit als Timer registrieren.
@@ -3476,6 +3927,8 @@ class Api:
         return self._state()
 
     def copy(self, text):
+        if _IS_MAC:
+            return _mac.copy_text(text)
         try:
             subprocess.run(["clip"], input=str(text), text=True, shell=True)
             return True
@@ -3585,14 +4038,7 @@ class Api:
 
         if pct <= warn_at and not warned:
             s["clawd_battery_warned"] = True
-            tray = getattr(self, "_tray", None)
-            if tray and tray.icon:
-                try:
-                    tray.icon.notify(
-                        t("Clawdmeter hat nur noch {pct}% Akku", pct=pct),
-                        "Clawd")
-                except Exception:
-                    pass
+            _system_notify(self, t("Clawdmeter hat nur noch {pct}% Akku", pct=pct))
         elif warned and pct >= warn_at + 10:
             s["clawd_battery_warned"] = False
         else:
@@ -3668,15 +4114,9 @@ class Api:
         """Tray-Meldung dass das 5h-Limit gleich voll ist."""
         mins = max(0, int((reset_at - time.time()) / 60))
         when = time.strftime("%H:%M", time.localtime(reset_at))
-        tray = getattr(self, "_tray", None)
-        if tray and tray.icon:
-            try:
-                tray.icon.notify(
-                    t("{pct}% deines 5-Stunden-Limits verbraucht. "
-                      "Zurückgesetzt um {when} – in {mins} Minuten.",
-                      pct=pct, when=when, mins=mins), "Clawd")
-            except Exception:
-                pass
+        _system_notify(self, t("{pct}% deines 5-Stunden-Limits verbraucht. "
+                               "Zurückgesetzt um {when} – in {mins} Minuten.",
+                               pct=pct, when=when, mins=mins))
 
     def _kick_usage_poll(self):
         """Einmalige Ratelimit-Abfrage im Hintergrund.
@@ -3765,7 +4205,34 @@ class Api:
         # Oberflaeche blendet die Kachel dann aus.
         return {"pct": 100 if hit else 0, "reset_at": reset_at, "hit": hit,
                 "wpct": 0, "wreset_at": 0,
-                "known": bool(hit), "now": now}
+                "known": bool(hit), "now": now,
+                "consent": self._token_consent()}
+
+    def _token_consent(self):
+        """macOS: "ask" solange niemand dem Lesen des Claude-Tokens aus dem
+        Schluesselbund zugestimmt hat, "blocked" nach einer Absage im
+        Systemdialog, sonst ""."""
+        if not _IS_MAC:
+            return ""
+        try:
+            import clawdmeter
+            return clawdmeter.keychain_consent()
+        except Exception:
+            return ""
+
+    def allow_token_access(self):
+        """Zustimmung aus der Einstellungs-Seite. Die erste Abfrage laeuft
+        sofort los - dabei fragt macOS nach dem Schluesselbund-Zugriff."""
+        self.settings["mac_token_access"] = True
+        save_json(SETTINGS_FILE, self.settings)
+        try:
+            import clawdmeter
+            clawdmeter.set_keychain_allowed(True)
+        except Exception:
+            pass
+        self._usage_kick_at = 0
+        self._kick_usage_poll()
+        return {"ok": True}
 
     def clawdmeter_state(self):
         """Status fuer die Einstellungs-Seite."""
@@ -4027,6 +4494,12 @@ class Api:
         """Fragt bei GitHub nach einer neueren Version. Unterscheidet zwischen
         Netzwerk-Fehler und "wirklich aktuell" damit die UI unterscheiden kann."""
         frozen = bool(getattr(sys, "frozen", False))
+        if _IS_MAC:
+            # Die Releases im Upstream-Repo sind Windows-Installer. Die
+            # Mac-Fassung wird aus dem Quelltext gebaut und nicht von hier
+            # aus ersetzt - es wird also auch nichts heruntergeladen.
+            return {"available": False, "current": VERSION, "frozen": frozen,
+                    "error": ""}
         try:
             data = self._remote_info()
             self._update_info = data
@@ -4186,8 +4659,9 @@ class Api:
         installer_url = data.get("installer_url") or ""
         exe_url = data.get("exe_url") or ""
 
-        # Im Entwicklungsmodus (.py, keine .exe): nur Release-Seite oeffnen
-        if not getattr(sys, "frozen", False):
+        # Im Entwicklungsmodus (.py, keine .exe) und auf dem Mac: nur die
+        # Release-Seite oeffnen
+        if not getattr(sys, "frozen", False) or _IS_MAC:
             webbrowser.open(page)
             return {"ok": False, "reason": "dev", "opened": True}
 
@@ -4385,6 +4859,7 @@ def logo_data_uri():
 def build_html():
     return (HTML_TEMPLATE
             .replace("__LOGO__", logo_data_uri())
+            .replace("__PLATFORM__", "mac" if _IS_MAC else "win")
             .replace("__I18N__", i18n.js_payload()))
 
 
@@ -5174,7 +5649,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2>Fast geschafft</h2>
       <div class="ob-line">
         <div><div class="ob-lbl">Heimatordner ausblenden</div>
-          <div class="ob-desc">Sessions, die direkt in deinem Benutzerordner (<code>C:\Users\...</code>) laufen, verstecken. Standardmäßig aus – aktiviere es nur, wenn dich diese Sessions stören.</div></div>
+          <div class="ob-desc">Sessions, die direkt in deinem Benutzerordner (<code id="ob-homepath">C:\Users\...</code>) laufen, verstecken. Standardmäßig aus – aktiviere es nur, wenn dich diese Sessions stören.</div></div>
         <div class="toggle" id="ob-home" onclick="obToggleHome(this)"></div>
       </div>
       <div class="ob-folder" id="ob-folder"></div>
@@ -5266,6 +5741,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
    Deutsch - die Oberflaeche bleibt bedienbar, auch waehrend die Tabelle noch
    waechst. Dieselbe Tabelle benutzt der Python-Teil.                        */
 let I18N = __I18N__;
+// Wo Windows und macOS verschieden heissen (Tray/Menueleiste, Autostart …)
+const PLATFORM = "__PLATFORM__";
+function P(win, mac){ return PLATFORM === 'mac' ? mac : win; }
 function t(text, vars){
   let out = (I18N.table && I18N.table[text]) || text;
   if(vars) out = out.replace(/\{(\w+)\}/g, (m,k)=> (k in vars ? vars[k] : m));
@@ -5476,6 +5954,10 @@ async function boot(){
     applyAccent(STATE.settings.accent || "#ec7456");
     applyBg(STATE.settings.bg_base || "#4a3a30");
     ingest(STATE);
+    if(PLATFORM === 'mac'){
+      const hp = document.getElementById('ob-homepath');
+      if(hp) hp.textContent = '/Users/...';
+    }
     // Erst einsammeln, dann uebersetzen - beides vor dem ersten Zeichnen,
     // solange Tabelle und Panels noch leer sind.
     collectStaticT();
@@ -5681,8 +6163,9 @@ async function refreshBuddyStatus(){
 }
 
 async function doRefresh(btn){if(btn)btn.disabled=true; ingest(await api.refresh()); render(); updateDetail(); if(btn)btn.disabled=false;}
-async function doResume(){const s=getSel(); if(!s)return; await api.resume(s.id,s.cwd,s.project||'');}
-async function doResumeRow(id){const s=sessions.find(x=>x.id===id); if(!s)return; selected=id; render(); await api.resume(s.id,s.cwd,s.project||'');}
+async function doResume(){const s=getSel(); if(!s)return; resumeResult(await api.resume(s.id,s.cwd,s.project||''));}
+async function doResumeRow(id){const s=sessions.find(x=>x.id===id); if(!s)return; selected=id; render(); resumeResult(await api.resume(s.id,s.cwd,s.project||''));}
+function resumeResult(r){ if(r && r.ok===false) toast(r.error || t('unbekannt')); }
 async function doCopy(){const s=getSel(); if(!s)return; await api.copy(s.id); toast(t('Session-ID kopiert ✓'));}
 
 /* ---- Farbe ---- */
@@ -5804,7 +6287,7 @@ async function renderBuddy(){
       <h2>${ic('clock')}Wann sichtbar</h2>
       <div class="sub">Der Buddy kann immer da sein oder nur wenn ein bestimmtes Programm gerade im Vordergrund ist – z.B. nur wenn Claude Code im Terminal läuft.</div>
       <div class="ba-vis">
-        <label class="ba-radio"><input type="radio" name="ba-vis" ${vis==='when_claude'?'checked':''} onchange="buddySet('visibility','when_claude')"> <span>Nur wenn Claude Code läuft <em class="ba-dim">(erkennt Terminal + <code>claude.exe</code>)</em></span></label>
+        <label class="ba-radio"><input type="radio" name="ba-vis" ${vis==='when_claude'?'checked':''} onchange="buddySet('visibility','when_claude')"> <span>Nur wenn Claude Code läuft <em class="ba-dim">(erkennt Terminal + <code>${P('claude.exe','claude')}</code>)</em></span></label>
         <label class="ba-radio"><input type="radio" name="ba-vis" ${vis==='always'?'checked':''} onchange="buddySet('visibility','always')"> <span>Immer sichtbar</span></label>
         <label class="ba-radio"><input type="radio" name="ba-vis" ${vis==='when_window'?'checked':''} onchange="buddySet('visibility','when_window')"> <span>Nur wenn dieses Fenster vorne ist:</span></label>
       </div>
@@ -6049,7 +6532,7 @@ function renderSettings(){
       <h2>${ic('globe')}${t('Sprache')}</h2>
       <div class="row2">
         <div><div class="lbl">${t('Sprache der Oberfläche')}</div>
-          <div class="desc">${t('„Automatisch" richtet sich nach Windows: deutsche Oberfläche auf deutschen Systemen, sonst Englisch.')}</div></div>
+          <div class="desc">${t(P('„Automatisch" richtet sich nach Windows: deutsche Oberfläche auf deutschen Systemen, sonst Englisch.', '„Automatisch" richtet sich nach macOS: deutsche Oberfläche auf deutschen Systemen, sonst Englisch.'))}</div></div>
         <select class="sel-input" onchange="setLanguage(this.value)">
           <option value="auto" ${(st.language||'auto')==='auto'?'selected':''}>${t('Automatisch')}</option>
           <option value="de" ${st.language==='de'?'selected':''}>Deutsch</option>
@@ -6075,7 +6558,7 @@ function renderSettings(){
       <h2>${ic('window')}Fenster schließen</h2>
       <div class="row2">
         <div><div class="lbl">Im Hintergrund weiterlaufen</div>
-          <div class="desc">Wenn aktiv, versteckt der X-Button die App nur (Icon im System-Tray unten rechts, Klick öffnet sie wieder).</div>
+          <div class="desc">${P('Wenn aktiv, versteckt der X-Button die App nur (Icon im System-Tray unten rechts, Klick öffnet sie wieder).', 'Wenn aktiv, versteckt der rote Schließen-Knopf die App nur (Symbol oben rechts in der Menüleiste, Klick öffnet sie wieder). Beenden mit ⌘Q.')}</div>
           ${st.close_to_tray===false ? `<div class="warnnote">${ic('warn')}<span>Das X beendet die App jetzt wirklich – Buddy, Clawdmeter und Benachrichtigungen laufen dann nicht mehr.</span></div>` : ''}</div>
         <div class="toggle ${st.close_to_tray!==false?'on':''}" onclick="toggleTray(this)"></div>
       </div>
@@ -6085,8 +6568,8 @@ function renderSettings(){
     <div class="card">
       <h2>${ic('power')}Autostart</h2>
       <div class="row2">
-        <div><div class="lbl">Mit Windows starten</div>
-          <div class="desc">Die App startet automatisch nach dem Anmelden – praktisch damit der Buddy und der Tray-Modus sofort verfügbar sind. Registry-Eintrag unter HKCU\\Run.</div></div>
+        <div><div class="lbl">${P('Mit Windows starten', 'Beim Anmelden starten')}</div>
+          <div class="desc">${P('Die App startet automatisch nach dem Anmelden – praktisch damit der Buddy und der Tray-Modus sofort verfügbar sind. Registry-Eintrag unter HKCU\\Run.', 'Die App startet automatisch nach dem Anmelden – praktisch damit der Buddy und das Menüleisten-Symbol sofort verfügbar sind. Eintrag unter ~/Library/LaunchAgents.')}</div></div>
         <div class="toggle ${st.autostart!==false?'on':''}" onclick="toggleAutostart(this)"></div>
       </div>
     </div>
@@ -6095,7 +6578,7 @@ function renderSettings(){
       <h2>${ic('bell')}Benachrichtigungen</h2>
       <div class="row2">
         <div><div class="lbl">Bei Limit-Reset benachrichtigen</div>
-          <div class="desc">Windows-Systembenachrichtigung wenn dein Claude-Limit sich zurückgesetzt hat und du wieder loslegen kannst. Braucht den System-Tray aktiv.</div></div>
+          <div class="desc">${P('Windows-Systembenachrichtigung wenn dein Claude-Limit sich zurückgesetzt hat und du wieder loslegen kannst. Braucht den System-Tray aktiv.', 'Systembenachrichtigung und eine Karte oben rechts, wenn dein Claude-Limit sich zurückgesetzt hat und du wieder loslegen kannst.')}</div></div>
         <div class="toggle ${st.notify_limit_reset!==false?'on':''}" onclick="toggleLimitNotif(this)"></div>
       </div>
       <div class="row2">
@@ -6120,8 +6603,7 @@ function renderSettings(){
         <div><div class="lbl">Womit öffnen?</div><div class="desc">Wie eine Session gestartet wird.</div></div>
         <select class="sel-input" onchange="api.update_setting('terminal',this.value)">
           <option value="auto" ${st.terminal==='auto'?'selected':''}>Automatisch</option>
-          <option value="wt" ${st.terminal==='wt'?'selected':''}>Windows Terminal</option>
-          <option value="cmd" ${st.terminal==='cmd'?'selected':''}>Eingabeaufforderung (cmd)</option>
+          ${terminalOptions(st.terminal)}
         </select>
       </div>
       <div class="row2">
@@ -6139,7 +6621,7 @@ function renderSettings(){
 
     <div class="card">
       <h2>${ic('bluetooth')}Clawdmeter</h2>
-      <div class="sub">Schickt deine Claude-Auslastung per Bluetooth an ein Clawdmeter-Gerät. Das Gerät muss einmalig in den Windows-Bluetooth-Einstellungen gekoppelt werden.</div>
+      <div class="sub">${P('Schickt deine Claude-Auslastung per Bluetooth an ein Clawdmeter-Gerät. Das Gerät muss einmalig in den Windows-Bluetooth-Einstellungen gekoppelt werden.', 'Schickt deine Claude-Auslastung per Bluetooth an ein Clawdmeter-Gerät. Es muss eingeschaltet und in Reichweite sein – macOS fragt beim ersten Verbinden nach der Bluetooth-Erlaubnis.')}</div>
       <div class="row2">
         <div><div class="lbl">Anbindung aktiv</div><div class="desc" id="clawd-status">…</div></div>
         <div class="toggle ${st.clawdmeter?'on':''}" onclick="toggleClawd(this)"></div>
@@ -6175,8 +6657,10 @@ function renderSettings(){
     <div class="secthead" id="sect-app">App</div>
     <div class="card">
       <h2>${ic('update')}Updates</h2>
-      <div class="sub">${t('Aktuelle Version: v{v} — beim Start wird automatisch nach Updates gesucht (ohne Internet wird das übersprungen).', {v: esc(STATE.version||'?')})}</div>
-      <div class="field">
+      <div class="sub">${PLATFORM === 'mac'
+        ? t('Aktuelle Version: v{v} — die macOS-Version aktualisiert sich nicht selbst. Für ein Update den Quelltext aktualisieren und build_mac.sh erneut ausführen.', {v: esc(STATE.version||'?')})
+        : t('Aktuelle Version: v{v} — beim Start wird automatisch nach Updates gesucht (ohne Internet wird das übersprungen).', {v: esc(STATE.version||'?')})}</div>
+      <div class="field" ${P('', 'style="display:none"')}>
         <button class="btn" onclick="manualCheck(this)">Nach Updates suchen</button>
         <span id="upd-status" class="badge"></span>
       </div>
@@ -6192,7 +6676,7 @@ function renderSettings(){
       </div>
       <div class="row2">
         <div><div class="lbl">Clawdmeter</div>
-          <div class="desc">Das Gerät und seine Firmware stammen von Hermann Björgvin. Für Verbrauch und Akku reicht seine Firmware — der Session Browser bringt nur die Anbindung für Windows mit.</div></div>
+          <div class="desc">${P('Das Gerät und seine Firmware stammen von Hermann Björgvin. Für Verbrauch und Akku reicht seine Firmware — der Session Browser bringt nur die Anbindung für Windows mit.', 'Das Gerät und seine Firmware stammen von Hermann Björgvin. Für Verbrauch und Akku reicht seine Firmware — der Session Browser bringt nur die Anbindung für Windows und macOS mit.')}</div></div>
         <button class="btn" onclick="api.open_url('https://github.com/HermannBjorgvin/Clawdmeter')">Öffnen</button>
       </div>
       <div class="row2">
@@ -6210,6 +6694,13 @@ function renderSettings(){
   refreshLimit();
   refreshClawd();
   loadClawdDevices(false);
+}
+
+function terminalOptions(cur){
+  const opts = P([['wt', 'Windows Terminal'], ['cmd', 'Eingabeaufforderung (cmd)']],
+                 [['terminal', 'Terminal'], ['iterm', 'iTerm2']]);
+  return opts.map(([v, label]) =>
+    `<option value="${v}" ${cur===v?'selected':''}>${label}</option>`).join('');
 }
 
 // ---- Limit-Anzeige ----
@@ -6247,11 +6738,26 @@ function paintLimit(){
   if(!box) return;
   const d = LIMIT;
   if(!d || !d.known){
+    // Nur neu schreiben, wenn sich etwas aendert: das hier laeuft jede
+    // Sekunde, und ein ersetzter Knopf verschluckt den Klick darauf.
+    const mode = (d && d.consent) || 'empty';
+    if(box.dataset.mode === mode) return;
+    box.dataset.mode = mode;
+    if(mode === 'ask'){
+      box.innerHTML = '<div class="lempty">'
+        + esc(t('Für die Auslastung liest die App den Token von Claude Code aus deinem Schlüsselbund und fragt damit bei der Anthropic-API nach. macOS fragt dabei einmal nach – wähle „Immer erlauben“, sonst kommt die Frage bei jeder Abfrage wieder.'))
+        + '<div style="margin-top:9px"><button class="btn accent mini" onclick="allowTokenAccess(this)">'
+        + esc(t('Zugriff erlauben')) + '</button></div></div>';
+      return;
+    }
     box.innerHTML = '<div class="lempty">'
-      + t('Noch keine Auslastungsdaten – kommt mit der nächsten Abfrage.')
+      + (mode === 'blocked'
+         ? t('Kein Zugriff auf den Schlüsselbund – nach einem Neustart der App kannst du es erneut versuchen.')
+         : t('Noch keine Auslastungsdaten – kommt mit der nächsten Abfrage.'))
       + '</div>';
     return;
   }
+  box.dataset.mode = 'data';
   if(d.reset_at && d.reset_at*1000 <= Date.now()){ refreshLimit(); return; }
   let html = limitCard(d.hit ? 100 : d.pct, d.reset_at, t('5 Stunden'), d.hit);
   // Wochenwert nur wenn er wirklich vorliegt - ohne Clawdmeter-Abfrage
@@ -6263,6 +6769,13 @@ async function refreshLimit(){
   if(!document.getElementById('limitbox')) return;
   try{ LIMIT = await api.limit_state(); }catch(e){ return; }
   paintLimit();
+}
+async function allowTokenAccess(btn){
+  btn.disabled = true;
+  try{ await api.allow_token_access(); }catch(e){}
+  // Die Abfrage laeuft im Hintergrund; macOS fragt dabei nach dem
+  // Schluesselbund - je nachdem, wie schnell du antwortest.
+  [1500, 5000, 12000].forEach(ms => setTimeout(refreshLimit, ms));
 }
 setInterval(()=>{ if(document.getElementById('limitbox')) paintLimit(); }, 1000);
 setInterval(()=>{ if(document.getElementById('limitbox')) refreshLimit(); }, 20000);
@@ -6332,7 +6845,7 @@ async function loadClawdDevices(rescan){
   const autoLbl = r&&r.auto ? `Automatisch (${esc(autoName||r.auto)})` : 'Automatisch (nichts gefunden)';
   let html = `<option value="" ${cur?'':'selected'}>${autoLbl}</option>`;
   if(!devs.length){
-    html += '<option value="" disabled>' + t('Keine gekoppelten Bluetooth-Geräte') + '</option>';
+    html += '<option value="" disabled>' + t(P('Keine gekoppelten Bluetooth-Geräte', 'Kein Clawdmeter in Reichweite gefunden')) + '</option>';
   } else {
     html += devs.map(d=>`<option value="${esc(d.address)}" ${cur===d.address?'selected':''}>${esc(d.name)} — ${esc(d.address)}</option>`).join('');
   }
@@ -6681,7 +7194,10 @@ def _autostart_target_exe():
 
 
 def set_autostart(enable):
-    """Windows-Autostart via HKCU\\...\\Run. `enable=False` entfernt Eintrag."""
+    """Windows-Autostart via HKCU\\...\\Run. `enable=False` entfernt Eintrag.
+    Unter macOS ein LaunchAgent."""
+    if _IS_MAC:
+        return _mac.set_autostart(enable)
     if not _IS_WIN:
         return False
     try:
@@ -6713,6 +7229,8 @@ def is_autostart_enabled():
     """Liest den aktuellen Autostart-Status aus der Registry und prueft
     dass die referenzierte .exe wirklich existiert (verwaiste Eintraege
     werden als 'nicht aktiv' behandelt)."""
+    if _IS_MAC:
+        return _mac.is_autostart_enabled()
     if not _IS_WIN:
         return False
     try:
@@ -6977,6 +7495,8 @@ def _acquire_single_instance():
 
 
 def _screen_w():
+    if _IS_MAC:
+        return _mac.primary_size()[0]
     try:
         return int(ctypes.windll.user32.GetSystemMetrics(0)) if _IS_WIN else 1920
     except Exception:
@@ -6984,6 +7504,8 @@ def _screen_w():
 
 
 def _screen_h():
+    if _IS_MAC:
+        return _mac.primary_size()[1]
     try:
         return int(ctypes.windll.user32.GetSystemMetrics(1)) if _IS_WIN else 1080
     except Exception:
@@ -7001,6 +7523,8 @@ def _position_is_usable(x, y, w, h):
     Verlangt wird nicht die volle Flaeche, sondern ein Stueck Titelleiste, das
     man mit der Maus noch treffen kann.
     """
+    if _IS_MAC:
+        return _mac.position_is_usable(x, y, w, h)
     if not _IS_WIN:
         return True
     try:
@@ -7098,6 +7622,9 @@ def _fit_main_window_now():
     physische. Auf einem skalierten Bildschirm (125 %, 150 %) waeren das zwei
     verschiedene Massstaebe - ueber das Handle bleibt alles in einem.
     """
+    if _IS_MAC:
+        win = webview.windows[0] if webview.windows else None
+        return _mac.fit_window(getattr(win, "native", None))
     hwnd = _own_window_hwnd()
     if not hwnd:
         return False
@@ -7198,6 +7725,15 @@ def main():
     # Single-Instance-Guard: nur eine App-Instanz gleichzeitig. Weiterer
     # Doppel-Klick bringt die bestehende (evtl. im Tray versteckte) Instanz
     # nach vorne statt eine neue zu starten.
+    show_main = {"fn": None}     # steht erst fest, wenn das Fenster da ist
+    _quit_wanted = {"v": False}
+    if _IS_MAC:
+        if not _mac.single_instance(
+                lambda: show_main["fn"] and show_main["fn"]()):
+            return
+        _mac.install_app_delegate(
+            on_reopen=lambda: show_main["fn"] and show_main["fn"](),
+            on_terminate=lambda: _quit_wanted.update(v=True))
     owned, mutex_handle = _acquire_single_instance()
     if not owned:
         if _restore_existing_window():
@@ -7248,6 +7784,9 @@ def main():
                 pass
     win = webview.create_window("Claude Session Browser", **kw)
     api.bind_window(win)
+    if _IS_MAC:
+        win.events.shown += lambda: _mac.on_main(_mac.track_main_window,
+                                                 win.native)
 
     # Autostart: beim ersten Start eintragen wenn Default aktiv ist.
     # Der Nutzer kann in den Einstellungen abschalten.
@@ -7294,8 +7833,6 @@ def main():
             pass
 
     # System-Tray – aktiv wenn "close_to_tray" gesetzt ist (Default).
-    _quit_wanted = {"v": False}
-
     def real_quit():
         _quit_wanted["v"] = True
         try:
@@ -7306,6 +7843,7 @@ def main():
 
     tray = TrayManager(lambda: (webview.windows[0] if webview.windows else None),
                        real_quit)
+    show_main["fn"] = tray.show_main
     if s.get("close_to_tray", True):
         tray.start()
 
@@ -7321,6 +7859,8 @@ def main():
                 win.hide()
             except Exception:
                 pass
+            if _IS_MAC:
+                _mac.set_dock_visible(False)
             return False
         return True
 
@@ -7333,8 +7873,13 @@ def main():
     api._real_quit = real_quit
     api._tray = tray
 
+    start_kw = {}
+    if _IS_MAC and not getattr(sys, "frozen", False):
+        # Aus dem Quelltext gestartet ist das Dock-Symbol sonst Pythons.
+        start_kw["icon"] = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "docs", "logo.png")
     try:
-        webview.start()
+        webview.start(**start_kw)
     finally:
         try:
             api.buddy.stop()

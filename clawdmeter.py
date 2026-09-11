@@ -103,8 +103,7 @@ def _extract_token(blob: str) -> str | None:
     return None
 
 
-def read_token() -> str | None:
-    """Liest den Claude-OAuth-Token aus der ersten gefundenen Credentials-Datei."""
+def _token_from_files() -> str | None:
     for path in _credential_candidates():
         try:
             tok = _extract_token(path.read_text(encoding="utf-8"))
@@ -113,6 +112,85 @@ def read_token() -> str | None:
         if tok:
             return tok
     return None
+
+
+# macOS: Claude Code legt die Zugangsdaten im Schluesselbund ab, nicht in
+# einer Datei. Gelesen wird dort erst, wenn der Nutzer in den Einstellungen
+# zugestimmt hat - sonst stuende gleich beim ersten Start ein
+# Schluesselbund-Dialog auf dem Schirm, ohne dass jemand weiss, wozu.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+_keychain = {"allowed": False, "token": None, "until": 0.0}
+
+
+def set_keychain_allowed(allowed: bool) -> None:
+    _keychain["allowed"] = bool(allowed)
+
+
+def keychain_consent() -> str:
+    """"ask" solange nicht zugestimmt, "blocked" nach einer Absage im
+    Systemdialog, sonst "" - auch wenn der Token ohnehin in einer Datei
+    liegt und der Schluesselbund gar nicht gebraucht wird."""
+    if sys.platform != "darwin" or _token_from_files():
+        return ""
+    if not _keychain["allowed"]:
+        return "ask"
+    try:
+        import macos_support
+        if macos_support.keychain_blocked():
+            return "blocked"
+    except Exception:
+        pass
+    return ""
+
+
+def _token_from_keychain() -> str | None:
+    """Mit Zwischenspeicher bis kurz vor Ablauf des Tokens: wer im
+    Systemdialog nur "Erlauben" statt "Immer erlauben" waehlt, soll nicht
+    alle paar Minuten wieder gefragt werden."""
+    if sys.platform != "darwin" or not _keychain["allowed"]:
+        return None
+    now = time.time()
+    if _keychain["token"] and now < _keychain["until"]:
+        return _keychain["token"]
+    try:
+        import macos_support
+        raw = macos_support.read_keychain_password(KEYCHAIN_SERVICE)
+    except Exception:
+        raw = None
+    tok = _extract_token(raw or "")
+    if not tok:
+        return None
+    until = now + 3600
+    try:
+        data = json.loads(raw)
+        exp = float((data.get("claudeAiOauth") or {}).get("expiresAt") or 0) / 1000
+        if exp:
+            until = min(until, exp - 60)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    _keychain["token"], _keychain["until"] = tok, until
+    return tok
+
+
+def _forget_token() -> None:
+    _keychain["token"], _keychain["until"] = None, 0.0
+
+
+def read_token() -> str | None:
+    """Liest den Claude-OAuth-Token aus der ersten gefundenen Credentials-Datei,
+    unter macOS sonst aus dem Schluesselbund."""
+    return _token_from_files() or _token_from_keychain()
+
+
+def _ssl_context():
+    """Bevorzugt den Zertifikatspeicher des Systems - funktioniert auch
+    hinter einer Firmen-Firewall mit TLS-Inspektion."""
+    try:
+        import ssl
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -164,12 +242,14 @@ def poll_usage_meta(token: str) -> tuple[dict | None, dict]:
     req = urllib.request.Request(API_URL, data=body, headers=headers,
                                  method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20,
+                                    context=_ssl_context()) as resp:
             hdrs = resp.headers
     except urllib.error.HTTPError as e:
         # 429 & Co. liefern die Header trotzdem mit
         hdrs = e.headers
         if e.code in (401, 403):
+            _forget_token()
             return None, {}
     except Exception:
         return None, {}
@@ -253,7 +333,14 @@ def list_paired_devices(force: bool = False) -> list[dict]:
     waren. Die Registry-Variante startet keinen Prozess und ist sofort da.
 
     Ein gekoppeltes UND verbundenes Geraet sendet keine Advertisements mehr,
-    ein normaler BLE-Scan findet es also nicht -- Windows kennt es aber."""
+    ein normaler BLE-Scan findet es also nicht -- Windows kennt es aber.
+
+    macOS gibt keine Liste gekoppelter Geraete heraus; dort wird in der
+    Umgebung gesucht. Gesucht wird nur auf Knopfdruck (`force`) oder bei
+    eingeschalteter Anbindung - schon die Suche loest beim ersten Mal die
+    Bluetooth-Rueckfrage von macOS aus."""
+    if sys.platform == "darwin":
+        return _mac_devices(force)
     if sys.platform != "win32":
         return []
     now = time.time()
@@ -306,6 +393,25 @@ def list_paired_devices(force: bool = False) -> list[dict]:
 
 def _looks_like_clawdmeter(name: str) -> bool:
     return "clawd" in (name or "").lower()
+
+
+_mac_scan = {"enabled": False}
+
+
+def _mac_devices(force: bool) -> list[dict]:
+    now = time.time()
+    fresh = now - _devices_cache["at"] < _DEVICES_TTL
+    if not force and (fresh or not _mac_scan["enabled"]):
+        return list(_devices_cache["value"])
+    try:
+        import macos_support
+        out = macos_support.ble_scan(
+            lambda name, uuids: SERVICE_UUID in uuids or _looks_like_clawdmeter(name))
+    except Exception:
+        return list(_devices_cache["value"])
+    _devices_cache["at"] = now
+    _devices_cache["value"] = out
+    return list(out)
 
 
 def discover_address(preferred: str | None = None) -> str | None:
@@ -394,6 +500,7 @@ class ClawdmeterLink:
             # Ein stop() ist noch im Gange: kurz auf das Ende warten, damit
             # nicht zwei Threads parallel auf dasselbe Geraet zugreifen.
             old.join(timeout=CONNECT_TIMEOUT + 5)
+        _mac_scan["enabled"] = True
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="clawdmeter")
@@ -401,6 +508,7 @@ class ClawdmeterLink:
         return True
 
     def stop(self) -> None:
+        _mac_scan["enabled"] = False
         self._stop.set()
 
     def is_running(self) -> bool:

@@ -17,6 +17,7 @@ beim Start in die Oberflaeche, `set_lang()` liefert sie beim Umschalten neu.
 import ctypes
 import json
 import re
+import sys
 
 # Sprachen, die es gibt. Alles andere faellt auf Englisch zurueck.
 LANGS = ("de", "en")
@@ -36,7 +37,17 @@ def detect_system_lang():
     GetUserDefaultUILanguage() liefert eine LANGID; die unteren 10 Bit sind
     die Hauptsprache, 0x07 steht fuer Deutsch. Damit sind alle Varianten
     abgedeckt (de-DE, de-AT, de-CH), ohne sie einzeln aufzuzaehlen.
+
+    Unter macOS zaehlt die erste bevorzugte Sprache der Systemeinstellungen.
     """
+    if sys.platform == "darwin":
+        try:
+            from Foundation import NSLocale
+            langs = NSLocale.preferredLanguages()
+            first = str(langs[0]) if langs else ""
+        except Exception:
+            first = ""
+        return "de" if first.lower().startswith("de") else "en"
     try:
         langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
         return "de" if (langid & 0x3FF) == 0x07 else "en"
@@ -731,5 +742,68 @@ TRANSLATIONS = {
         "deutschen Systemen, sonst Englisch.":
             "\"Automatic\" follows Windows: German on German systems, "
             "English everywhere else.",
+
+        # ---- macOS ----------------------------------------------------------
+        "„Automatisch\" richtet sich nach macOS: deutsche Oberfläche auf "
+        "deutschen Systemen, sonst Englisch.":
+            "\"Automatic\" follows macOS: German on German systems, "
+            "English everywhere else.",
+        "Wenn aktiv, versteckt der rote Schließen-Knopf die App nur (Symbol "
+        "oben rechts in der Menüleiste, Klick öffnet sie wieder). Beenden "
+        "mit ⌘Q.":
+            "When on, the red close button only hides the app (icon at the "
+            "top right of the menu bar; click it to bring the app back). "
+            "Quit with ⌘Q.",
+        "Beim Anmelden starten": "Open at login",
+        "Die App startet automatisch nach dem Anmelden – praktisch damit der "
+        "Buddy und das Menüleisten-Symbol sofort verfügbar sind. Eintrag "
+        "unter ~/Library/LaunchAgents.":
+            "The app starts by itself when you log in – handy so the buddy "
+            "and the menu bar icon are there right away. Entry under "
+            "~/Library/LaunchAgents.",
+        "Systembenachrichtigung und eine Karte oben rechts, wenn dein "
+        "Claude-Limit sich zurückgesetzt hat und du wieder loslegen kannst.":
+            "A system notification and a card at the top right when your "
+            "Claude limit has reset and you can carry on.",
+        "Schickt deine Claude-Auslastung per Bluetooth an ein "
+        "Clawdmeter-Gerät. Es muss eingeschaltet und in Reichweite sein – "
+        "macOS fragt beim ersten Verbinden nach der Bluetooth-Erlaubnis.":
+            "Sends your Claude usage over Bluetooth to a Clawdmeter. It needs "
+            "to be switched on and in range – macOS asks for Bluetooth "
+            "permission the first time it connects.",
+        "Kein Clawdmeter in Reichweite gefunden":
+            "No Clawdmeter found in range",
+        "Das Gerät und seine Firmware stammen von Hermann Björgvin. Für "
+        "Verbrauch und Akku reicht seine Firmware — der Session Browser "
+        "bringt nur die Anbindung für Windows und macOS mit.":
+            "The device and its firmware come from Hermann Björgvin. For "
+            "usage and battery his firmware is all you need — the Session "
+            "Browser only adds the Windows and macOS connection.",
+        "Aktuelle Version: v{v} — die macOS-Version aktualisiert sich nicht "
+        "selbst. Für ein Update den Quelltext aktualisieren und build_mac.sh "
+        "erneut ausführen.":
+            "You have v{v} — the macOS version doesn't update itself. To "
+            "update, pull the latest source and run build_mac.sh again.",
+        "Für die Auslastung liest die App den Token von Claude Code aus "
+        "deinem Schlüsselbund und fragt damit bei der Anthropic-API nach. "
+        "macOS fragt dabei einmal nach – wähle „Immer erlauben“, sonst kommt "
+        "die Frage bei jeder Abfrage wieder.":
+            "To show your usage, the app reads Claude Code's token from your "
+            "keychain and asks the Anthropic API with it. macOS asks you "
+            "once – pick \"Always Allow\", otherwise the question comes back "
+            "on every check.",
+        "Zugriff erlauben": "Allow access",
+        "Kein Zugriff auf den Schlüsselbund – nach einem Neustart der App "
+        "kannst du es erneut versuchen.":
+            "No keychain access – restart the app to try again.",
+        "Terminal konnte nicht geöffnet werden: {grund}":
+            "Couldn't open the terminal: {grund}",
     },
 }
+
+# Gleicher deutscher Schluessel, auf dem Mac aber anderes Englisch: die
+# Kartenueberschrift "Autostart" heisst unter Windows "Start with Windows".
+if sys.platform == "darwin":
+    TRANSLATIONS["en"].update({
+        "Autostart": "Open at login",
+    })

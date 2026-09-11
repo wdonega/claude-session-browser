@@ -3,10 +3,32 @@ build/
 dist/
 *.spec
 *.exe
+*.dmg
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+
+# IDEs und Editoren
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# macOS
+.DS_Store
+._*
+
+# Claude Code: persoenliche Einstellungen je Projekt
+.claude/settings.local.json
 
 # Lokale Daten / Streudateien (nichts Persoenliches ins Repo)
 webview_debug.txt
