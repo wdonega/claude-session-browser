@@ -5,8 +5,9 @@
 # Claude Session Browser
 
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)](https://github.com/juppeee/claude-session-browser/releases/latest)
+[![macOS](https://img.shields.io/badge/macOS-11%2B-555555)](#macos)
 [![Python](https://img.shields.io/badge/Python-3.11-3776ab)](https://www.python.org/)
-[![UI](https://img.shields.io/badge/UI-pywebview%20%2B%20WebView2-ec7456)](https://pywebview.flowrl.com/)
+[![UI](https://img.shields.io/badge/UI-pywebview%20%2B%20WebView2%20%7C%20WebKit-ec7456)](https://pywebview.flowrl.com/)
 [![License](https://img.shields.io/badge/License-MIT-3ecf8e)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/juppeee/claude-session-browser?color=ffb454)](https://github.com/juppeee/claude-session-browser/releases/latest)
 
@@ -16,7 +17,9 @@
 
 <sub>Installs per user — no admin rights, no UAC prompt, and it never touches `~/.claude`</sub>
 
-[Quick start](#quick-start) · [What you get](#what-you-get) · [Clawd](#clawd-your-desktop-buddy) · [Clawdmeter](#clawdmeter) · [Settings](#settings) · [Uninstall](#updating-and-uninstalling) · [Credits](#credits)
+<sub>On a Mac? <a href="#macos">Build it from source</a> — one script.</sub>
+
+[Quick start](#quick-start) · [macOS](#macos) · [What you get](#what-you-get) · [Clawd](#clawd-your-desktop-buddy) · [Clawdmeter](#clawdmeter) · [Settings](#settings) · [Uninstall](#updating-and-uninstalling) · [Credits](#credits)
 
 </div>
 
@@ -40,13 +43,14 @@ and puts you back into one with a double-click.
 - **Every session in one list** — Claude's auto-title or your own, folder, message count, last activity
 - **Find it fast** — live search across title, folder, ID and first question; sortable, configurable columns
 - **Make it yours** — colour-code sessions, rename them for good, copy the ID
-- **One click back in** — opens Windows Terminal or `cmd` with the session resumed
+- **One click back in** — opens Windows Terminal or `cmd` (Terminal or iTerm2 on a Mac) with the session resumed
 - **Know where your quota stands** — 5-hour and weekly usage with a live countdown to the reset
 - **Get told, not surprised** — a heads-up before the limit is full, and a notification when it resets
 - **[Clawd](#clawd-your-desktop-buddy)** — a 20×20 pixel buddy on your desktop who acts out what Claude is doing
 - **[Clawdmeter](#clawdmeter) support** — mirror Clawd onto a real device over Bluetooth
-- **German and English**, following your Windows language
-- **Updates itself** from GitHub
+- **German and English**, following your system language
+- **Windows and macOS** — the same app, with the menu bar standing in for the tray on a Mac
+- **Updates itself** from GitHub (Windows)
 
 ## Quick start
 
@@ -77,6 +81,8 @@ python claude_sessions.py
 pip install bleak
 ```
 
+On a Mac, see [macOS](#macos) — `pystray` and `Pillow` aren't needed there.
+
 </details>
 
 <details>
@@ -90,6 +96,56 @@ build.bat
 
 Three files land in `dist\`: the installer, a standalone one-file exe, and the
 separate updater.
+
+</details>
+
+## macOS
+
+The Windows installer doesn't run on a Mac — build the app from source
+instead. You need Python 3.10 or newer (`brew install python`); the script sets
+up everything else in a local `.venv`. In a clone of this repository:
+
+```bash
+./build_mac.sh --install
+```
+
+That builds `Claude Session Browser.app` and copies it to `~/Applications`, where
+Spotlight and Launchpad find it. Without `--install` it stays in `dist/`. No
+admin rights needed, and since you built it yourself, Gatekeeper has nothing to
+warn about.
+
+To run it straight from source instead, after the script has set up `.venv`:
+
+```bash
+.venv/bin/python claude_sessions.py
+```
+
+What's different on a Mac:
+
+- **Menu bar instead of tray** — the red close button hides the app into the
+  menu bar (Clawd's face, top right); ⌘Q quits for real
+- **Resuming a session** opens Terminal, or iTerm2 if it's running — pick one
+  under **Settings → Connections**
+- **Your quota** — Claude Code keeps its login in the macOS keychain, not in a
+  file. The app reads it only after you click **Allow access** under
+  **Settings → Your limit**; macOS then asks once — choose *Always Allow*
+- **Window titles** — macOS hands out other apps' window titles only with the
+  *Screen Recording* permission, which the app doesn't ask for. "Only when this
+  window is in front" therefore matches app names (Terminal, iTerm2 …), and for
+  permission prompts turn on the [hook](#clawd-your-desktop-buddy)
+- **No self-update** — the GitHub releases are Windows builds. To update, pull
+  the latest source and run `./build_mac.sh --install` again
+
+<details>
+<summary><b>How the Mac version is built</b></summary>
+
+Everything macOS-specific lives in `macos_support.py`. AppKit wants every
+window on the main thread, which pywebview already owns, so the Tkinter windows
+the Windows build uses for Clawd, the reset card and the placement grid are
+rebuilt there as native panels; the logic deciding what Clawd shows is shared
+with Windows. Sessions open through a small `.command` script, so neither
+Terminal nor iTerm2 needs an automation permission. Autostart is a LaunchAgent,
+and a second launch brings the running app to the front.
 
 </details>
 
@@ -137,7 +193,7 @@ sessions you start afterwards.
 
 The [Clawdmeter](https://github.com/HermannBjorgvin/Clawdmeter) is a small ESP32
 device by [Hermann Björgvin](https://github.com/HermannBjorgvin) that displays
-your Claude usage. This app speaks to it over Bluetooth on Windows and can
+your Claude usage. This app speaks to it over Bluetooth on Windows and macOS and can
 mirror Clawd onto it, so the device acts out the same state your desktop buddy
 does, rather than only reacting to how fast your quota is burning. It reports
 its battery level back, and warns you before it runs flat.
@@ -152,6 +208,12 @@ its battery level back, and warns you before it runs flat.
 
 Pair the device once in the Windows Bluetooth settings, then enable it under
 **Settings → Connections**.
+
+On a Mac the app finds the device by scanning instead: switch it on, enable it
+under **Settings → Connections** and press *Search for devices again* — macOS
+asks for Bluetooth permission the first time. This path is new and hasn't been
+tested against a real device yet; a device the Mac already holds connected
+(as a keyboard, say) may not show up in the scan.
 
 **Stock firmware is enough for most of it.** Usage and battery need nothing
 special — flash Hermann's firmware as usual and the device shows your quota
@@ -178,12 +240,12 @@ See [Credits](#credits) for who built what.
 
 | Setting | Default | What it does |
 |---|---|---|
-| Language | Automatic | German on German Windows, English everywhere else |
-| Open with | Automatic | Windows Terminal, or `cmd` if that's missing |
+| Language | Automatic | German on a German system, English everywhere else |
+| Open with | Automatic | Windows Terminal, or `cmd` if that's missing — on a Mac iTerm2 if it's running, otherwise Terminal |
 | Claude command | `claude` | Path or name of the Claude CLI |
-| Keep running in background | On | The X button hides the app in the system tray |
-| Start with Windows | On | Registry entry under `HKCU\Run` |
-| Notify on limit reset | On | A Windows notification when your quota is back |
+| Keep running in background | On | The X button hides the app in the system tray (the menu bar on a Mac) |
+| Start with Windows / Open at login | On | Registry entry under `HKCU\Run`; a LaunchAgent on a Mac |
+| Notify on limit reset | On | A system notification when your quota is back |
 | Warn before the limit is full | On, at 90% | Once per 5-hour window |
 | Clawdmeter battery warning | On, at 15% | Once per discharge |
 
@@ -197,6 +259,8 @@ See [Credits](#credits) for who built what.
 | `~/.claude/session_titles.json` | Titles you renamed yourself |
 | `~/.claude/settings.json` | Claude Code's own settings — only touched if you enable the hook |
 | `~/.claude/csb_hooks/` | What the hook reports, one small file per session |
+| `~/Library/LaunchAgents/io.github.juppeee.claude-session-browser.plist` | Mac only: the entry that opens the app at login |
+| Keychain item *Claude Code-credentials* | Mac only: Claude Code's login — read only, and only after you allow it |
 
 </details>
 
@@ -225,6 +289,8 @@ missing translation shows German rather than an empty label.
 `tools/check_i18n.py` verifies every string has an English version and that
 placeholders match on both sides; it runs as the first step of every build.
 
+The Mac-specific parts are described under [macOS](#macos).
+
 </details>
 
 <details>
@@ -248,6 +314,12 @@ sessions, titles and settings under `~/.claude` survive. Delete
 `session_browser_settings.json` and `session_titles.json` by hand if you want
 those gone too.
 
+On a Mac there's no self-update: pull the latest source and run
+`./build_mac.sh --install` again. To remove it, quit the app (⌘Q), delete
+`Claude Session Browser.app` from `~/Applications`, and delete
+`~/Library/LaunchAgents/io.github.juppeee.claude-session-browser.plist` if it
+opened at login. Everything under `~/.claude` survives, as on Windows.
+
 ## Credits
 
 **The Clawdmeter is not this project's work.** The device and its firmware are the work of [Hermann Björgvin](https://github.com/HermannBjorgvin/Clawdmeter) — the hardware abstraction, five board ports, the LVGL interface, the BLE service and the animation engine are all his.
@@ -256,7 +328,7 @@ Talking to it is one feature of this app among many. The Session Browser is firs
 
 **Clawd himself** comes from [claudepix](https://claudepix.vercel.app) by [@amaanbuilds](https://x.com/amaanbuilds), a library of pixel-art Clawd sprites — the same source Hermann's firmware draws on. Some of the animations here were taken from there, others inspired by it, and nearly all have been reworked or redrawn since. Go and have a look, it's where Clawd got his face.
 
-What this project adds on top of Hermann's work is two things: the Bluetooth connection for Windows (his daemon is a Linux shell script built on bluez), and **activity-driven animations**. Upstream picks an animation from how fast your quota is burning — a rate measured over a six-sample ring buffer and grouped into calm / normal / active / heavy. It cannot know *what* Claude is doing. The Session Browser reads the session transcripts, works out the actual state — thinking, writing code, waiting for permission, out of quota — and tells the device which animation to show. Turn that off and the device falls back to Hermann's usage groups.
+What this project adds on top of Hermann's work is two things: the Bluetooth connection for Windows and macOS (his daemon is a Linux shell script built on bluez), and **activity-driven animations**. Upstream picks an animation from how fast your quota is burning — a rate measured over a six-sample ring buffer and grouped into calm / normal / active / heavy. It cannot know *what* Claude is doing. The Session Browser reads the session transcripts, works out the actual state — thinking, writing code, waiting for permission, out of quota — and tells the device which animation to show. Turn that off and the device falls back to Hermann's usage groups.
 
 ## License
 
